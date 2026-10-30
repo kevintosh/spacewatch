@@ -1,0 +1,22 @@
+#!/bin/zsh
+set -euo pipefail
+PROFILE="${1:-home}"
+BIN="$HOME/.local/bin/spacewatch"
+[[ -x "$BIN" ]] || { echo "Install the utility first with ./install.sh"; exit 1; }
+mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs/SpaceWatch"
+PLIST="$HOME/Library/LaunchAgents/com.kevintosh.spacewatch.plist"
+cat > "$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>Label</key><string>com.kevintosh.spacewatch</string>
+<key>ProgramArguments</key><array><string>$BIN</string><string>watch</string><string>$PROFILE</string></array>
+<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+<key>StandardOutPath</key><string>$HOME/Library/Logs/SpaceWatch/out.log</string>
+<key>StandardErrorPath</key><string>$HOME/Library/Logs/SpaceWatch/error.log</string>
+</dict></plist>
+PLIST
+launchctl bootout "gui/$(id -u)/com.kevintosh.spacewatch" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$PLIST"
+echo "Watcher installed for profile: $PROFILE"
+echo "Grant Accessibility permission to $BIN if macOS prompts, or add it in System Settings > Privacy & Security > Accessibility."

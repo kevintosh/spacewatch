@@ -1,0 +1,364 @@
+import Foundation
+import AppKit
+import CoreGraphics
+import ApplicationServices
+import Darwin
+
+// MacSpaceRestorer
+// Captures window frames and macOS Space UUIDs, then restores them after a display reconnect.
+// Space moves use dynamically loaded private SkyLight symbols. Frame restoration uses public AX APIs.
+
+struct Rect: Codable { let x: Double; let y: Double; let width: Double; let height: Double }
+struct DisplayFingerprint: Codable, Hashable {
+    let uuid: String
+    let vendor: UInt32
+    let model: UInt32
+    let serial: UInt32
+    let width: Int
+    let height: Int
+}
+struct SavedWindow: Codable {
+    let windowID: UInt32
+    let bundleID: String
+    let appName: String
+    let title: String
+    let role: String
+    let subrole: String
+    let frame: Rect
+    let spaceUUID: String?
+    let displayUUID: String?
+    let ordinal: Int
+}
+struct Profile: Codable {
+    let name: String
+    let createdAt: Date
+    let displays: [DisplayFingerprint]
+    let windows: [SavedWindow]
+}
+
+let fm = FileManager.default
+let dataDir = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/MacSpaceRestorer", isDirectory: true)
+let profilesDir = dataDir.appendingPathComponent("Profiles", isDirectory: true)
+try? fm.createDirectory(at: profilesDir, withIntermediateDirectories: true)
+
+func die(_ text: String, code: Int32 = 1) -> Never { fputs("mac-space-restorer: \(text)\n", stderr); exit(code) }
+func log(_ text: String) { print("mac-space-restorer: \(text)") }
+func profileURL(_ name: String) -> URL {
+    let safe = name.replacingOccurrences(of: "/", with: "_")
+    return profilesDir.appendingPathComponent(safe).appendingPathExtension("json")
+}
+
+func displayUUID(_ id: CGDirectDisplayID) -> String {
+    guard let u = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue() else { return "display-\(id)" }
+    return CFUUIDCreateString(nil, u) as String
+}
+func currentDisplays() -> [DisplayFingerprint] {
+    var count: UInt32 = 0
+    CGGetOnlineDisplayList(0, nil, &count)
+    var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+    CGGetOnlineDisplayList(count, &ids, &count)
+    return ids.prefix(Int(count)).map { id in
+        let mode = CGDisplayCopyDisplayMode(id)
+        return DisplayFingerprint(uuid: displayUUID(id), vendor: CGDisplayVendorNumber(id), model: CGDisplayModelNumber(id), serial: CGDisplaySerialNumber(id), width: mode?.pixelWidth ?? Int(CGDisplayBounds(id).width), height: mode?.pixelHeight ?? Int(CGDisplayBounds(id).height))
+    }.sorted { $0.uuid < $1.uuid }
+}
+
+func trusted(prompt: Bool) -> Bool {
+    let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: prompt] as CFDictionary
+    return AXIsProcessTrustedWithOptions(opts)
+}
+
+@_silgen_name("_AXUIElementGetWindow")
+func _AXUIElementGetWindow(_ element: AXUIElement, _ identifier: UnsafeMutablePointer<CGWindowID>) -> AXError
+
+func attr<T>(_ e: AXUIElement, _ key: String, as: T.Type) -> T? {
+    var value: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(e, key as CFString, &value) == .success else {
+        return nil
+    }
+    return value as? T
+}
+
+func stringAttr(_ e: AXUIElement, _ key: String) -> String {
+    attr(e, key, as: String.self) ?? ""
+}
+
+func pointAttr(_ e: AXUIElement, _ key: String) -> CGPoint? {
+    guard let v = attr(e, key, as: AXValue.self) else {
+        return nil
+    }
+
+    var p = CGPoint.zero
+    return AXValueGetValue(v, .cgPoint, &p) ? p : nil
+}
+
+func sizeAttr(_ e: AXUIElement, _ key: String) -> CGSize? {
+    guard let v = attr(e, key, as: AXValue.self) else {
+        return nil
+    }
+
+    var s = CGSize.zero
+    return AXValueGetValue(v, .cgSize, &s) ? s : nil
+}
+
+func setPoint(_ e: AXUIElement, _ key: String, _ p: CGPoint) {
+    var p = p
+    if let v = AXValueCreate(.cgPoint, &p) {
+        AXUIElementSetAttributeValue(e, key as CFString, v)
+    }
+}
+
+func setSize(_ e: AXUIElement, _ key: String, _ s: CGSize) {
+    var s = s
+    if let v = AXValueCreate(.cgSize, &s) {
+        AXUIElementSetAttributeValue(e, key as CFString, v)
+    }
+}
+
+struct LiveWindow { let ax: AXUIElement; let id: UInt32; let bundleID: String; let appName: String; let title: String; let role: String; let subrole: String; let frame: Rect }
+func liveWindows() -> [LiveWindow] {
+    var out: [LiveWindow] = []
+    for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
+        guard let bid = app.bundleIdentifier else { continue }
+        let appAX = AXUIElementCreateApplication(app.processIdentifier)
+        guard let windows = attr(appAX, kAXWindowsAttribute, as: [AXUIElement].self) else { continue }
+        for w in windows {
+            var id: CGWindowID = 0
+            guard _AXUIElementGetWindow(w, &id) == .success, id != 0,
+                  let p = pointAttr(w, kAXPositionAttribute), let s = sizeAttr(w, kAXSizeAttribute),
+                  s.width > 40, s.height > 30 else { continue }
+            out.append(LiveWindow(ax: w, id: id, bundleID: bid, appName: app.localizedName ?? bid,
+                                  title: stringAttr(w, kAXTitleAttribute), role: stringAttr(w, kAXRoleAttribute),
+                                  subrole: stringAttr(w, kAXSubroleAttribute),
+                                  frame: Rect(x: p.x, y: p.y, width: s.width, height: s.height)))
+        }
+    }
+    return out
+}
+
+struct SpaceState { var windowToSpaceUUID: [UInt32:String] = [:]; var uuidToManagedID: [String:UInt64] = [:]; var uuidToDisplayUUID: [String:String] = [:] }
+func spaceState() -> SpaceState {
+    var st = SpaceState()
+    guard let domain = UserDefaults.standard.persistentDomain(forName: "com.apple.spaces"),
+          let config = domain["SpacesDisplayConfiguration"] as? [String:Any],
+          let props = config["Space Properties"] as? [[String:Any]] else { return st }
+    for p in props {
+        guard let uuid = p["name"] as? String else { continue }
+        if let wins = p["windows"] as? [NSNumber] { for n in wins { st.windowToSpaceUUID[n.uint32Value] = uuid } }
+    }
+    if let md = config["Management Data"] as? [String:Any], let monitors = md["Monitors"] as? [[String:Any]] {
+        for m in monitors {
+            let monitorDisplay = (m["Display Identifier"] as? String) ?? ""
+            var spaces: [[String:Any]] = []
+            if let x = m["Spaces"] as? [[String:Any]] { spaces += x }
+            if let x = m["Collapsed Space"] as? [String:Any] { spaces.append(x) }
+            for s in spaces {
+                guard let uuid = s["uuid"] as? String else { continue }
+                if let n = s["ManagedSpaceID"] as? NSNumber { st.uuidToManagedID[uuid] = n.uint64Value }
+                let d = (s["Display Identifier"] as? String) ?? monitorDisplay
+                if !d.isEmpty && d != "Main" { st.uuidToDisplayUUID[uuid] = d }
+            }
+        }
+    }
+    return st
+}
+
+func saveProfile(_ name: String) {
+    guard trusted(prompt: true) else { die("Accessibility permission is required. Enable it in System Settings > Privacy & Security > Accessibility, then run snapshot again.") }
+    let live = liveWindows(); let ss = spaceState()
+    var ordinals: [String:Int] = [:]
+    let saved = live.map { w -> SavedWindow in
+        let key = "\(w.bundleID)|\(w.title)|\(w.role)|\(w.subrole)"
+        let ordinal = ordinals[key, default: 0]; ordinals[key] = ordinal + 1
+        let su = ss.windowToSpaceUUID[w.id]
+        return SavedWindow(windowID: w.id, bundleID: w.bundleID, appName: w.appName, title: w.title, role: w.role,
+                           subrole: w.subrole, frame: w.frame, spaceUUID: su, displayUUID: su.flatMap { ss.uuidToDisplayUUID[$0] }, ordinal: ordinal)
+    }
+    let profile = Profile(name: name, createdAt: Date(), displays: currentDisplays(), windows: saved)
+    let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]; enc.dateEncodingStrategy = .iso8601
+    do { try enc.encode(profile).write(to: profileURL(name), options: .atomic); log("saved profile '\(name)' with \(saved.count) windows") }
+    catch { die("could not save profile: \(error)") }
+}
+
+final class SkyLight {
+    typealias MainConnFn = @convention(c) () -> UInt32
+    typealias MoveFn = @convention(c) (UInt32, CFArray, UInt64) -> CGError
+    let handle: UnsafeMutableRawPointer?
+    let mainConn: MainConnFn?
+    let move: MoveFn?
+    init() {
+        handle = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY)
+        if let h = handle, let p1 = dlsym(h, "CGSMainConnectionID"), let p2 = dlsym(h, "CGSMoveWindowsToManagedSpace") {
+            mainConn = unsafeBitCast(p1, to: MainConnFn.self); move = unsafeBitCast(p2, to: MoveFn.self)
+        } else { mainConn = nil; move = nil }
+    }
+    func moveWindow(_ id: UInt32, to managedSpaceID: UInt64) -> Bool {
+        guard let c = mainConn, let m = move else { return false }
+        let ids = [NSNumber(value: id)] as CFArray
+        return m(c(), ids, managedSpaceID) == .success
+    }
+}
+
+func score(_ saved: SavedWindow, _ live: LiveWindow) -> Int {
+    guard saved.bundleID == live.bundleID else { return -100000 }
+    var s = 1000
+    if saved.title == live.title { s += 800 }
+    else if !saved.title.isEmpty && !live.title.isEmpty && (saved.title.contains(live.title) || live.title.contains(saved.title)) { s += 300 }
+    if saved.role == live.role { s += 80 }; if saved.subrole == live.subrole { s += 80 }
+    s -= Int(abs(saved.frame.width-live.frame.width) / 10 + abs(saved.frame.height-live.frame.height) / 10)
+    return s
+}
+
+func loadProfile(_ name: String) -> Profile {
+    do { let d = try Data(contentsOf: profileURL(name)); let dec = JSONDecoder(); dec.dateDecodingStrategy = .iso8601; return try dec.decode(Profile.self, from: d) }
+    catch { die("could not load profile '\(name)': \(error)") }
+}
+
+func displaySetMatches(_ p: Profile) -> Bool {
+    let a = Set(p.displays.map { "\($0.vendor):\($0.model):\($0.serial):\($0.width)x\($0.height)" })
+    let b = Set(currentDisplays().map { "\($0.vendor):\($0.model):\($0.serial):\($0.width)x\($0.height)" })
+    return a == b
+}
+
+func profileIsReady(_ profile: Profile) -> Bool {
+    // The physical display configuration must match first.
+    guard displaySetMatches(profile) else {
+        return false
+    }
+
+    // Then make sure WindowServer has recreated all Spaces
+    // required by the saved profile.
+    let spaces = spaceState()
+
+    let requiredSpaceUUIDs = Set(
+        profile.windows.compactMap { $0.spaceUUID }
+    )
+
+    for uuid in requiredSpaceUUIDs {
+        guard spaces.uuidToManagedID[uuid] != nil else {
+            return false
+        }
+    }
+
+    return true
+}
+
+func restoreProfile(_ name: String, requireDisplayMatch: Bool = true) {
+    guard trusted(prompt: true) else { die("Accessibility permission is required.") }
+    let p = loadProfile(name)
+    if requireDisplayMatch && !displaySetMatches(p) { log("display set does not match profile '\(name)'; restore skipped"); return }
+    // Thread.sleep(forTimeInterval: 1.2)
+    var live = liveWindows(); var used = Set<UInt32>(); let spaces = spaceState(); let sky = SkyLight()
+    var restored = 0, movedSpaces = 0, unmatched = 0
+    for sw in p.windows {
+        let candidates = live.filter { !used.contains($0.id) }.sorted { score(sw, $0) > score(sw, $1) }
+        guard let w = candidates.first, score(sw, w) > 900 else { unmatched += 1; continue }
+        used.insert(w.id)
+        // Move to the persistent Space first, resolving its current runtime ManagedSpaceID.
+        if let su = sw.spaceUUID, let sid = spaces.uuidToManagedID[su], sky.moveWindow(w.id, to: sid) { movedSpaces += 1 }
+        setPoint(w.ax, kAXPositionAttribute, CGPoint(x: sw.frame.x, y: sw.frame.y))
+        setSize(w.ax, kAXSizeAttribute, CGSize(width: sw.frame.width, height: sw.frame.height))
+        // Some apps constrain size based on the old display until the move has settled.
+        usleep(25000)
+        setPoint(w.ax, kAXPositionAttribute, CGPoint(x: sw.frame.x, y: sw.frame.y))
+        setSize(w.ax, kAXSizeAttribute, CGSize(width: sw.frame.width, height: sw.frame.height))
+        restored += 1
+    }
+    log("restored \(restored) windows; moved \(movedSpaces) to saved Spaces; \(unmatched) unmatched")
+}
+
+final class Watcher {
+    let profile: String
+    var timer: Timer?
+    var lastSignature = ""
+    var waitingForReady = false
+
+    init(_ profile: String) {
+        self.profile = profile
+        self.lastSignature = signature()
+    }
+
+    func signature() -> String {
+        currentDisplays()
+            .map {
+                "\($0.vendor):\($0.model):\($0.serial):\($0.width)x\($0.height)"
+            }
+            .joined(separator: "|")
+    }
+
+    func waitUntilReady() {
+        let p = loadProfile(profile)
+
+        guard displaySetMatches(p) else {
+            waitingForReady = false
+            log("display configuration changed while waiting; restore cancelled")
+            return
+        }
+
+        if profileIsReady(p) {
+            log("display and Spaces are ready; restoring")
+            waitingForReady = false
+            restoreProfile(profile)
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.waitUntilReady()
+        }
+    }
+
+    func start() {
+        log("watching display changes for profile '\(profile)' (Ctrl-C to stop)")
+
+        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) {
+            [weak self] _ in
+
+            guard let self else { return }
+
+            let now = self.signature()
+
+            if now != self.lastSignature {
+                self.lastSignature = now
+
+                let p = loadProfile(self.profile)
+
+                if displaySetMatches(p), !self.waitingForReady {
+                    self.waitingForReady = true
+                    log("matching display set detected; waiting for Spaces")
+                    self.waitUntilReady()
+                }
+            }
+        }
+
+        RunLoop.main.run()
+    }
+}
+
+func usage() -> Never {
+    print("""
+    Usage:
+      mac-space-restorer snapshot PROFILE
+      mac-space-restorer restore PROFILE
+      mac-space-restorer watch PROFILE
+      mac-space-restorer list
+      mac-space-restorer displays
+
+    Run 'snapshot home' while every window is on its intended display and Space.
+    'watch home' restores automatically when the exact saved display set returns.
+    """)
+    exit(0)
+}
+
+let args = Array(CommandLine.arguments.dropFirst())
+guard let cmd = args.first else { usage() }
+switch cmd {
+case "snapshot": guard args.count == 2 else { usage() }; saveProfile(args[1])
+case "restore": guard args.count == 2 else { usage() }; restoreProfile(args[1], requireDisplayMatch: false)
+case "watch": guard args.count == 2 else { usage() }; Watcher(args[1]).start()
+case "list":
+    let xs = (try? fm.contentsOfDirectory(at: profilesDir, includingPropertiesForKeys: nil)) ?? []
+    xs.filter { $0.pathExtension == "json" }.forEach { print($0.deletingPathExtension().lastPathComponent) }
+case "displays":
+    for d in currentDisplays() { print("\(d.uuid) vendor=\(d.vendor) model=\(d.model) serial=\(d.serial) \(d.width)x\(d.height)") }
+default: usage()
+}

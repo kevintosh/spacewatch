@@ -1,0 +1,10 @@
+#!/bin/zsh
+set -euo pipefail
+cd "${0:A:h}"
+command -v swift >/dev/null || { echo "Swift is required. Install Xcode Command Line Tools with: xcode-select --install"; exit 1; }
+swift build -c release
+mkdir -p "$HOME/.local/bin"
+cp .build/release/mac-space-restorer "$HOME/.local/bin/mac-space-restorer"
+echo "Installed: $HOME/.local/bin/mac-space-restorer"
+echo 'Add this to ~/.zshrc if needed: export PATH="$HOME/.local/bin:$PATH"'
+echo "Next: mac-space-restorer snapshot home"

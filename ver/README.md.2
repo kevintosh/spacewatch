@@ -1,0 +1,133 @@
+# SpaceWatch
+
+This small native macOS command-line utility / watcher automatically fixes window placement changing after external displays disconnect and reconnect.
+WindowServer actually preserves display and Space UUIDs, but still changes some windows placement, coordinates, or sets them to the wrong display or the wrong Space.
+
+## What it does
+
+- Saves individual regular application windows, including bundle ID, title, CoreGraphics window ID, frame, persistent Space UUID and display UUID.
+- Matches the exact monitor set using CoreGraphics vendor/model/serial/resolution data. This allows separate profiles (e.g. `home` and `office`).
+- On restore, resolves each persistent Space UUID to its current runtime ManagedSpaceID, moves the window, then restores position and size.
+- Can watch for display changes and automatically restore when a saved monitor set returns.
+
+## Important limitations
+
+- Position and size use Apple's public Accessibility API.
+- Moving a window to a Space uses dynamically loaded private SkyLight functions. This requires no SIP change and no scripting addition, but Apple can change these functions in a future macOS update.
+- Windows with identical app/title/role are matched heuristically. Stable browser page titles improve matching. Untitled or dynamically titled windows can remain unmatched.
+- Full-screen Spaces and Stage Manager are not supported. Turn Stage Manager off.
+- The utility cannot be compiled in this package's Linux build environment. Build it on the Mac with Apple's Swift toolchain.
+
+## Installation
+
+1. Extract the archive.
+2. In Terminal:
+
+```zsh
+cd ~/Downloads/SpaceWatch
+chmod +x install.sh install-watcher.sh uninstall.sh
+./install.sh
+```
+
+If `swift` is unavailable:
+
+```zsh
+xcode-select --install
+```
+
+Add the binary directory to the shell path if required:
+
+```zsh
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+## Grant permission
+
+Run once:
+
+```zsh
+spacewatch displays
+spacewatch snapshot home
+```
+
+macOS should request Accessibility permission. If it does not, open **System Settings > Privacy & Security > Accessibility**, press **+**, then add:
+
+```text
+~/.local/bin/spacewatch
+```
+
+You may need to press Command+Shift+G in the file chooser and enter the full path.
+
+## Create a manual profile
+
+SpaceWatch will monitor your displays UUIDs and automatically create profiles. If you want to extend this functionality, you can manually create and restore profiles. Simply arrange all windows and Spaces exactly as desired, then:
+
+```zsh
+spacewatch snapshot home
+```
+
+Test manually:
+
+```zsh
+spacewatch restore home
+```
+
+Profiles are stored under:
+
+```text
+~/Library/Application Support/SpaceWatch/Profiles/
+```
+
+## Automatic restore
+
+After the `home` profile works manually:
+
+```zsh
+./install-watcher.sh home
+```
+
+The watcher checks the display set every two seconds. When the exact Cinema/MacBook set returns, it waits four seconds for WindowServer and restores the profile.
+
+For the office, use manual restore or change the watcher profile. The included watcher intentionally watches one profile at a time to avoid applying the wrong layout.
+
+Logs:
+
+```text
+~/Library/Logs/SpaceWatch/out.log
+~/Library/Logs/SpaceWatch/error.log
+```
+
+## Safe testing sequence
+
+1. Quit or save important documents.
+2. Disable Stage Manager.
+3. Arrange only a few test windows first, including two Safari windows on different Spaces.
+4. `spacewatch snapshot home`
+5. Disconnect and reconnect the Mac.
+6. `spacewatch restore home`
+7. Confirm Space and frame restoration before enabling the watcher.
+
+## Remove
+
+```zsh
+./uninstall.sh
+```
+
+The uninstall script deliberately preserves profiles.
+
+## Disclaimer
+
+This software is provided “as is”, without warranty of any kind, express or implied, including but not limited to warranties of merchantability, fitness for a particular purpose, and non-infringement.
+Use this software entirely at your own risk. The authors and contributors shall not be liable for any direct, indirect, incidental, special, consequential, or other damages arising from the use of, or inability to use, this software. This includes, without limitation, loss of data, loss of work, application or system instability, and unintended changes to windows, displays, Spaces, desktop arrangements, or other macOS settings.
+This project is an independent open-source project and is not affiliated with, authorised, sponsored, or endorsed by Apple Inc. macOS behaviour and APIs may change between operating system releases, and functionality that works on one version of macOS may not work correctly on another.
+Always save important work and maintain appropriate backups before using this software.
+
+## License
+
+SPDX-License-Identifier: GPL-3.0-or-later
+
+This project is free software licensed under the GNU General Public License, version 3 (GPL-3.0).
+You may redistribute and/or modify this software under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License or, if you choose, any later version.
+This software is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY, without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+See the LICENSE file included with this project for the full licence terms.
