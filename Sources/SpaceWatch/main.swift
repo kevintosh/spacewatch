@@ -72,13 +72,24 @@ try? fileManager.createDirectory(
     attributes: nil
 )
 
+private let logTimestampFormatter: ISO8601DateFormatter = {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter
+}()
+
+func timestampedMessage(_ text: String) -> String {
+    "[\(logTimestampFormatter.string(from: Date()))] spacewatch: \(text)"
+}
+
 func die(_ text: String, code: Int32 = 1) -> Never {
-    fputs("spacewatch: \(text)\n", stderr)
+    fputs("\(timestampedMessage(text))\n", stderr)
+    fflush(stderr)
     exit(code)
 }
 
 func log(_ text: String) {
-    print("spacewatch: \(text)")
+    print(timestampedMessage(text))
     fflush(stdout)
 }
 
